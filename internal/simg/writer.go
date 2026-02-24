@@ -309,8 +309,8 @@ func buildTree(rootDir string) (*node, []*node, error) {
 }
 
 func writeSquashFS(ws *writeState, root *node, all []*node, writeFiles func(*writeState, []*node) error) (int64, error) {
-	if err := ws.write(make([]byte, binary.Size(squashSuperblock{}))); err != nil {
-		return 0, fmt.Errorf("reserve squashfs superblock: %w", err)
+	if err := reserveSquashSuperblock(ws); err != nil {
+		return 0, err
 	}
 
 	inodes := inodeOrder(root)
@@ -321,6 +321,27 @@ func writeSquashFS(ws *writeState, root *node, all []*node, writeFiles func(*wri
 	if err := writeFiles(ws, inodes); err != nil {
 		return 0, err
 	}
+
+	return finalizeSquashFS(ws, root, all, inodes)
+}
+
+func writeSquashFSPrepared(ws *writeState, root *node, all []*node) (int64, error) {
+	inodes := inodeOrder(root)
+	for i, n := range inodes {
+		n.inodeNum = uint32(i + 1)
+	}
+
+	return finalizeSquashFS(ws, root, all, inodes)
+}
+
+func reserveSquashSuperblock(ws *writeState) error {
+	if err := ws.write(make([]byte, binary.Size(squashSuperblock{}))); err != nil {
+		return fmt.Errorf("reserve squashfs superblock: %w", err)
+	}
+	return nil
+}
+
+func finalizeSquashFS(ws *writeState, root *node, all, inodes []*node) (int64, error) {
 
 	assignInodeTypesAndSizes(inodes)
 	assignInodeRefs(inodes)

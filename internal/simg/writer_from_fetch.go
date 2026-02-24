@@ -56,11 +56,6 @@ func WriteFromFetchDir(fetchDir, outPath, arch string) error {
 		return fmt.Errorf("arch mismatch: requested %q, fetched image is %q", normArch, metaArch)
 	}
 
-	root, allNodes, err := buildTreeFromLayers(result.Layers)
-	if err != nil {
-		return err
-	}
-
 	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return fmt.Errorf("create output file %s: %w", outPath, err)
@@ -78,11 +73,16 @@ func WriteFromFetchDir(fetchDir, outPath, arch string) error {
 		return err
 	}
 
-	writeFiles := func(ws *writeState, inodes []*node) error {
-		return writeFileDataFromLayers(ws, inodes, result.Layers)
+	if err := reserveSquashSuperblock(ws); err != nil {
+		return err
 	}
 
-	squashSize, err := writeSquashFS(ws, root, allNodes, writeFiles)
+	root, allNodes, err := buildTreeAndWriteDataFromLayers(ws, result.Layers)
+	if err != nil {
+		return err
+	}
+
+	squashSize, err := writeSquashFSPrepared(ws, root, allNodes)
 	if err != nil {
 		return err
 	}
@@ -132,25 +132,29 @@ func readFetchResult(fetchDir string) (*fetchResult, error) {
 	return &r, nil
 }
 
-func buildTreeFromLayers(layers []fetchLayer) (*node, []*node, error) {
-	nodeByPath := map[string]*node{
-		"": {
-			name:  "",
-			kind:  nodeDirectory,
-			mode:  0o755 | os.ModeDir,
-			mtime: toUnix32(time.Now()),
-		},
+func buildTreeAndWriteDataFromLayers(ws *writeState, layers []fetchLayer) (*node, []*node, error) {
+	root := &node{
+		name:  "",
+		kind:  nodeDirectory,
+		mode:  0o755 | os.ModeDir,
+		mtime: toUnix32(time.Now()),
 	}
+	nodeByPath := map[string]*node{"": root}
+	ownerByPath := map[string]int{"": len(layers)}
 
-	for i, layer := range layers {
+	whiteoutPath := make(map[string]int)
+	opaqueDir := make(map[string]int)
+
+	buf := make([]byte, squashBlockSize)
+
+	for layerIndex := len(layers) - 1; layerIndex >= 0; layerIndex-- {
+		layer := layers[layerIndex]
 		rc, err := openLayerReader(layer)
 		if err != nil {
 			return nil, nil, err
 		}
 
 		tr := tar.NewReader(rc)
-		seq := 0
-
 		for {
 			hdr, err := tr.Next()
 			if err == io.EOF {
@@ -177,50 +181,91 @@ func buildTreeFromLayers(layers []fetchLayer) (*node, []*node, error) {
 			}
 
 			if base == ".wh..wh..opq" {
-				opaqDir := dir
-				ensureDirNode(nodeByPath, opaqDir, hdr.ModTime)
-				removeChildren(nodeByPath, opaqDir)
+				ensureDirAtLayer(nodeByPath, ownerByPath, dir, hdr.ModTime, layerIndex)
+				removeOwnedChildren(nodeByPath, ownerByPath, dir, layerIndex)
+				setLayerMarker(opaqueDir, dir, layerIndex)
 				continue
 			}
 
 			if strings.HasPrefix(base, ".wh.") {
 				victim := path.Join(dir, strings.TrimPrefix(base, ".wh."))
-				removePathRecursive(nodeByPath, victim)
+				removeOwnedSubtree(nodeByPath, ownerByPath, victim, layerIndex)
+				setLayerMarker(whiteoutPath, victim, layerIndex)
 				continue
 			}
 
-			ensureDirNode(nodeByPath, dir, hdr.ModTime)
+			if pathBlockedByHigherLayers(rel, layerIndex, nodeByPath, ownerByPath, whiteoutPath, opaqueDir) {
+				continue
+			}
+
+			ensureDirAtLayer(nodeByPath, ownerByPath, dir, hdr.ModTime, layerIndex)
 
 			switch hdr.Typeflag {
 			case tar.TypeDir:
-				upsertDirNode(nodeByPath, rel, hdr)
+				n := &node{
+					name:  path.Base(rel),
+					kind:  nodeDirectory,
+					mode:  os.FileMode(hdr.Mode) | os.ModeDir,
+					mtime: toUnix32(hdr.ModTime),
+				}
+				setNodeAtLayer(nodeByPath, ownerByPath, rel, n, layerIndex)
+
 			case tar.TypeReg, tar.TypeRegA:
-				seq++
+				if hdr.Size < 0 {
+					rc.Close()
+					return nil, nil, fmt.Errorf("negative file size for %s in %s", rel, layer.Path)
+				}
+
+				startRel := ws.relPos
+				blocks := make([]uint32, 0, int((hdr.Size+int64(squashBlockSize)-1)/int64(squashBlockSize)))
+				remaining := uint64(hdr.Size)
+				for remaining > 0 {
+					chunk := len(buf)
+					if remaining < uint64(chunk) {
+						chunk = int(remaining)
+					}
+					nr, err := io.ReadFull(tr, buf[:chunk])
+					if err != nil {
+						rc.Close()
+						return nil, nil, fmt.Errorf("read file payload for %s from %s: %w", rel, layer.Path, err)
+					}
+					if err := ws.write(buf[:nr]); err != nil {
+						rc.Close()
+						return nil, nil, fmt.Errorf("write file payload for %s: %w", rel, err)
+					}
+					blocks = append(blocks, uint32(nr)|squashDataUncompressed)
+					remaining -= uint64(nr)
+				}
+
 				n := &node{
 					name:         path.Base(rel),
 					kind:         nodeRegular,
 					mode:         os.FileMode(hdr.Mode),
 					mtime:        toUnix32(hdr.ModTime),
 					size:         uint64(hdr.Size),
-					sourceKey:    sourceKey(i, seq),
-					sourceLayer:  i,
-					sourceSeq:    seq,
-					sourceOrigin: true,
+					fileStartRel: startRel,
+					fileBlocks:   blocks,
 				}
-				setNode(nodeByPath, rel, n)
+				setNodeAtLayer(nodeByPath, ownerByPath, rel, n, layerIndex)
+
 			case tar.TypeSymlink:
+				linkMode := os.FileMode(hdr.Mode & 0o777)
+				if linkMode == 0 {
+					linkMode = 0o777
+				}
 				n := &node{
 					name:  path.Base(rel),
 					kind:  nodeSymlink,
-					mode:  os.ModeSymlink | 0o777,
+					mode:  os.ModeSymlink | linkMode,
 					mtime: toUnix32(hdr.ModTime),
 					link:  hdr.Linkname,
 				}
-				setNode(nodeByPath, rel, n)
+				setNodeAtLayer(nodeByPath, ownerByPath, rel, n, layerIndex)
+
 			case tar.TypeLink:
 				target := resolveHardlinkTarget(nodeByPath, rel, hdr.Linkname)
 				targetNode := nodeByPath[target]
-				if targetNode == nil || targetNode.kind != nodeRegular || targetNode.sourceKey == "" {
+				if targetNode == nil || targetNode.kind != nodeRegular {
 					rc.Close()
 					return nil, nil, fmt.Errorf("invalid hardlink %q -> %q in %s", rel, hdr.Linkname, layer.Path)
 				}
@@ -230,12 +275,11 @@ func buildTreeFromLayers(layers []fetchLayer) (*node, []*node, error) {
 					mode:         os.FileMode(hdr.Mode),
 					mtime:        toUnix32(hdr.ModTime),
 					size:         targetNode.size,
-					sourceKey:    targetNode.sourceKey,
-					sourceLayer:  targetNode.sourceLayer,
-					sourceSeq:    targetNode.sourceSeq,
-					sourceOrigin: false,
+					fileStartRel: targetNode.fileStartRel,
+					fileBlocks:   append([]uint32(nil), targetNode.fileBlocks...),
 				}
-				setNode(nodeByPath, rel, n)
+				setNodeAtLayer(nodeByPath, ownerByPath, rel, n, layerIndex)
+
 			default:
 				continue
 			}
@@ -246,6 +290,10 @@ func buildTreeFromLayers(layers []fetchLayer) (*node, []*node, error) {
 		}
 	}
 
+	return finalizeNodeTree(nodeByPath)
+}
+
+func finalizeNodeTree(nodeByPath map[string]*node) (*node, []*node, error) {
 	root := nodeByPath[""]
 	if root == nil {
 		return nil, nil, fmt.Errorf("internal error: missing root node")
@@ -303,149 +351,79 @@ func buildTreeFromLayers(layers []fetchLayer) (*node, []*node, error) {
 	return root, all, nil
 }
 
-func writeFileDataFromLayers(ws *writeState, inodes []*node, layers []fetchLayer) error {
-	type record struct {
-		startRel uint64
-		blocks   []uint32
-		written  bool
-		size     uint64
+func setLayerMarker(markers map[string]int, rel string, layer int) {
+	rel = normalizeHardlinkPath(rel)
+	if prev, ok := markers[rel]; ok && prev >= layer {
+		return
 	}
-
-	required := make(map[string]*node)
-	records := make(map[string]*record)
-
-	for _, n := range inodes {
-		if n.kind != nodeRegular {
-			continue
-		}
-		if n.sourceKey == "" {
-			n.fileStartRel = ws.relPos
-			n.fileBlocks = nil
-			continue
-		}
-		if _, ok := records[n.sourceKey]; !ok {
-			records[n.sourceKey] = &record{size: n.size}
-		}
-		if n.sourceOrigin && n.size > 0 {
-			required[n.sourceKey] = n
-		}
-	}
-
-	buf := make([]byte, squashBlockSize)
-
-	for layerIndex, layer := range layers {
-		rc, err := openLayerReader(layer)
-		if err != nil {
-			return err
-		}
-		tr := tar.NewReader(rc)
-		seq := 0
-
-		for {
-			hdr, err := tr.Next()
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				rc.Close()
-				return fmt.Errorf("read tar header from %s: %w", layer.Path, err)
-			}
-
-			if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
-				continue
-			}
-			rel, err := cleanRelPath(hdr.Name)
-			if err != nil {
-				rc.Close()
-				return fmt.Errorf("invalid path %q in %s: %w", hdr.Name, layer.Path, err)
-			}
-			if rel == "" {
-				continue
-			}
-			base := path.Base(rel)
-			if base == ".wh..wh..opq" || strings.HasPrefix(base, ".wh.") {
-				continue
-			}
-
-			seq++
-			key := sourceKey(layerIndex, seq)
-			target := required[key]
-			if target == nil {
-				continue
-			}
-			rec := records[key]
-			if rec == nil {
-				rc.Close()
-				return fmt.Errorf("missing source record for %s", key)
-			}
-			if rec.written {
-				continue
-			}
-
-			rec.startRel = ws.relPos
-			rec.blocks = rec.blocks[:0]
-
-			remaining := target.size
-			for remaining > 0 {
-				chunk := len(buf)
-				if remaining < uint64(chunk) {
-					chunk = int(remaining)
-				}
-				n, err := io.ReadFull(tr, buf[:chunk])
-				if err != nil {
-					rc.Close()
-					return fmt.Errorf("read file payload for %s from %s: %w", target.name, layer.Path, err)
-				}
-				if err := ws.write(buf[:n]); err != nil {
-					rc.Close()
-					return fmt.Errorf("write payload for %s: %w", target.name, err)
-				}
-				rec.blocks = append(rec.blocks, uint32(n)|squashDataUncompressed)
-				remaining -= uint64(n)
-			}
-
-			rec.written = true
-		}
-
-		if err := rc.Close(); err != nil {
-			return fmt.Errorf("close layer %s: %w", layer.Path, err)
-		}
-	}
-
-	for key, n := range required {
-		rec := records[key]
-		if rec == nil || !rec.written {
-			return fmt.Errorf("missing required file payload for %s (source %s)", n.name, key)
-		}
-	}
-
-	for _, n := range inodes {
-		if n.kind != nodeRegular || n.sourceKey == "" {
-			continue
-		}
-		rec := records[n.sourceKey]
-		if rec == nil {
-			return fmt.Errorf("missing source record for %s", n.sourceKey)
-		}
-		n.fileStartRel = rec.startRel
-		n.fileBlocks = append([]uint32(nil), rec.blocks...)
-	}
-
-	return nil
+	markers[rel] = layer
 }
 
-func sourceKey(layer, seq int) string {
-	return fmt.Sprintf("%d:%d", layer, seq)
-}
-
-func ensureDirNode(nodeByPath map[string]*node, rel string, mtime time.Time) *node {
-	rel = strings.TrimPrefix(rel, "/")
-	rel = path.Clean(rel)
-	if rel == "." {
-		rel = ""
-	}
+func pathBlockedByHigherLayers(rel string, layer int, nodeByPath map[string]*node, ownerByPath, whiteoutPath, opaqueDir map[string]int) bool {
 	if rel == "" {
-		return nodeByPath[""]
+		return false
+	}
+
+	if owner, ok := ownerByPath[rel]; ok && owner > layer {
+		return true
+	}
+
+	if rootOpaque, ok := opaqueDir[""]; ok && rootOpaque > layer {
+		return true
+	}
+
+	cur := rel
+	for {
+		if markLayer, ok := whiteoutPath[cur]; ok && markLayer > layer {
+			return true
+		}
+
+		parent := path.Dir(cur)
+		if parent == "." {
+			parent = ""
+		}
+		if parent == cur {
+			break
+		}
+		if parent != "" {
+			if owner, ok := ownerByPath[parent]; ok && owner > layer {
+				p := nodeByPath[parent]
+				if p != nil && p.kind != nodeDirectory {
+					return true
+				}
+			}
+		}
+		if parent == "" {
+			break
+		}
+		cur = parent
+	}
+
+	cur = path.Dir(rel)
+	if cur == "." {
+		cur = ""
+	}
+	for cur != "" {
+		if markLayer, ok := opaqueDir[cur]; ok && markLayer > layer {
+			return true
+		}
+		parent := path.Dir(cur)
+		if parent == "." {
+			parent = ""
+		}
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+
+	return false
+}
+
+func ensureDirAtLayer(nodeByPath map[string]*node, ownerByPath map[string]int, rel string, mtime time.Time, layer int) {
+	rel = normalizeHardlinkPath(rel)
+	if rel == "" {
+		return
 	}
 
 	parts := strings.Split(rel, "/")
@@ -459,74 +437,102 @@ func ensureDirNode(nodeByPath map[string]*node, rel string, mtime time.Time) *no
 		} else {
 			cur = cur + "/" + part
 		}
-		n := nodeByPath[cur]
-		if n == nil {
-			n = &node{name: part, kind: nodeDirectory, mode: 0o755 | os.ModeDir, mtime: toUnix32(mtime)}
-			nodeByPath[cur] = n
+
+		existing := nodeByPath[cur]
+		existingLayer := ownerByPath[cur]
+		if existing != nil && existingLayer > layer {
+			if existing.kind != nodeDirectory {
+				return
+			}
 			continue
 		}
-		if n.kind != nodeDirectory {
-			removePathRecursive(nodeByPath, cur)
-			n = &node{name: part, kind: nodeDirectory, mode: 0o755 | os.ModeDir, mtime: toUnix32(mtime)}
-			nodeByPath[cur] = n
-		}
-	}
-	return nodeByPath[rel]
-}
 
-func upsertDirNode(nodeByPath map[string]*node, rel string, hdr *tar.Header) {
-	n := nodeByPath[rel]
-	if n == nil {
-		n = &node{name: path.Base(rel), kind: nodeDirectory}
-		nodeByPath[rel] = n
-	}
-	if n.kind != nodeDirectory {
-		removePathRecursive(nodeByPath, rel)
-		n = &node{name: path.Base(rel), kind: nodeDirectory}
-		nodeByPath[rel] = n
-	}
-	n.mode = os.FileMode(hdr.Mode) | os.ModeDir
-	n.mtime = toUnix32(hdr.ModTime)
-}
-
-func setNode(nodeByPath map[string]*node, rel string, n *node) {
-	if existing := nodeByPath[rel]; existing != nil {
-		removePathRecursive(nodeByPath, rel)
-	}
-	nodeByPath[rel] = n
-}
-
-func removeChildren(nodeByPath map[string]*node, dir string) {
-	if dir == "." {
-		dir = ""
-	}
-	if dir == "" {
-		for k := range nodeByPath {
-			if k == "" {
+		if existing != nil && existingLayer == layer {
+			if existing.kind == nodeDirectory {
 				continue
 			}
-			delete(nodeByPath, k)
+			removeOwnedSubtree(nodeByPath, ownerByPath, cur, layer)
+			existing = nil
 		}
-		return
-	}
-	prefix := dir + "/"
-	for k := range nodeByPath {
-		if strings.HasPrefix(k, prefix) {
-			delete(nodeByPath, k)
+
+		if existing == nil {
+			nodeByPath[cur] = &node{
+				name:  part,
+				kind:  nodeDirectory,
+				mode:  0o755 | os.ModeDir,
+				mtime: toUnix32(mtime),
+			}
+			ownerByPath[cur] = layer
 		}
 	}
 }
 
-func removePathRecursive(nodeByPath map[string]*node, rel string) {
-	rel = strings.TrimPrefix(rel, "/")
+func setNodeAtLayer(nodeByPath map[string]*node, ownerByPath map[string]int, rel string, n *node, layer int) {
+	rel = normalizeHardlinkPath(rel)
 	if rel == "" {
 		return
 	}
-	delete(nodeByPath, rel)
+
+	if existingLayer, ok := ownerByPath[rel]; ok {
+		if existingLayer > layer {
+			return
+		}
+		if existingLayer == layer {
+			removeOwnedSubtree(nodeByPath, ownerByPath, rel, layer)
+		} else {
+			delete(nodeByPath, rel)
+			delete(ownerByPath, rel)
+		}
+	}
+
+	nodeByPath[rel] = n
+	ownerByPath[rel] = layer
+}
+
+func removeOwnedChildren(nodeByPath map[string]*node, ownerByPath map[string]int, dir string, layer int) {
+	dir = normalizeHardlinkPath(dir)
+	if dir == "" {
+		for p, own := range ownerByPath {
+			if p == "" || own != layer {
+				continue
+			}
+			delete(ownerByPath, p)
+			delete(nodeByPath, p)
+		}
+		return
+	}
+
+	prefix := dir + "/"
+	for p, own := range ownerByPath {
+		if own != layer {
+			continue
+		}
+		if strings.HasPrefix(p, prefix) {
+			delete(ownerByPath, p)
+			delete(nodeByPath, p)
+		}
+	}
+}
+
+func removeOwnedSubtree(nodeByPath map[string]*node, ownerByPath map[string]int, rel string, layer int) {
+	rel = normalizeHardlinkPath(rel)
+	if rel == "" {
+		return
+	}
+
+	if own, ok := ownerByPath[rel]; ok && own == layer {
+		delete(ownerByPath, rel)
+		delete(nodeByPath, rel)
+	}
+
 	prefix := rel + "/"
-	for k := range nodeByPath {
-		if strings.HasPrefix(k, prefix) {
-			delete(nodeByPath, k)
+	for p, own := range ownerByPath {
+		if own != layer {
+			continue
+		}
+		if strings.HasPrefix(p, prefix) {
+			delete(ownerByPath, p)
+			delete(nodeByPath, p)
 		}
 	}
 }
