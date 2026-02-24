@@ -146,6 +146,25 @@ func main() {
 		}); err != nil {
 			fatal(err)
 		}
+	case "pack-registry":
+		pk := flag.NewFlagSet("pack-registry", flag.ContinueOnError)
+		pk.SetOutput(io.Discard)
+		arch := pk.String("arch", "", "target OCI architecture (default: host)")
+		cpuProfile := pk.String("cpuprofile", "", "write CPU profile to file")
+		memProfile := pk.String("memprofile", "", "write heap profile to file")
+		if err := pk.Parse(os.Args[2:]); err != nil {
+			fatal(err)
+		}
+		args := pk.Args()
+		if len(args) != 2 {
+			usage()
+			os.Exit(2)
+		}
+		if err := runWithProfiles(*cpuProfile, *memProfile, func() error {
+			return app.RunPackRegistry(args[0], args[1], *arch)
+		}); err != nil {
+			fatal(err)
+		}
 	default:
 		usage()
 		os.Exit(2)
@@ -162,6 +181,7 @@ func usage() {
 	fmt.Fprintf(os.Stderr, "  gosimg serve [-addr 127.0.0.1:5000] <fetched-oci-dir>\n")
 	fmt.Fprintf(os.Stderr, "  gosimg pack [-arch <goarch>] [-cpuprofile file] [-memprofile file] <rootfs-dir> <out.simg>\n")
 	fmt.Fprintf(os.Stderr, "  gosimg pack-oci [-arch <goarch>] [-cpuprofile file] [-memprofile file] <fetched-oci-dir> <out.simg>\n")
+	fmt.Fprintf(os.Stderr, "  gosimg pack-registry [-arch amd64|arm64] [-cpuprofile file] [-memprofile file] <oci-image-ref> <out.simg>\n")
 }
 
 func fatal(err error) {

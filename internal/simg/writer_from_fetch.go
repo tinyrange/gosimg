@@ -29,6 +29,12 @@ type fetchLayer struct {
 	Path      string `json:"path"`
 }
 
+type LayerSource struct {
+	Name      string
+	MediaType string
+	Open      func() (io.ReadCloser, error)
+}
+
 func WriteFromFetchDir(fetchDir, outPath, arch string) error {
 	if strings.TrimSpace(fetchDir) == "" {
 		return fmt.Errorf("fetch directory is required")
@@ -56,6 +62,35 @@ func WriteFromFetchDir(fetchDir, outPath, arch string) error {
 		return fmt.Errorf("arch mismatch: requested %q, fetched image is %q", normArch, metaArch)
 	}
 
+	layers := make([]LayerSource, 0, len(result.Layers))
+	for _, layer := range result.Layers {
+		layerPath := layer.Path
+		layers = append(layers, LayerSource{
+			Name:      layerPath,
+			MediaType: layer.MediaType,
+			Open: func() (io.ReadCloser, error) {
+				f, err := os.Open(layerPath)
+				if err != nil {
+					return nil, fmt.Errorf("open layer %s: %w", layerPath, err)
+				}
+				return f, nil
+			},
+		})
+	}
+
+	return WriteFromLayerSources(layers, outPath, normArch)
+}
+
+func WriteFromLayerSources(layers []LayerSource, outPath, arch string) error {
+	if len(layers) == 0 {
+		return fmt.Errorf("at least one OCI layer is required")
+	}
+	if strings.TrimSpace(outPath) == "" {
+		return fmt.Errorf("output path is required")
+	}
+
+	normArch := normalizeArch(arch)
+
 	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return fmt.Errorf("create output file %s: %w", outPath, err)
@@ -77,7 +112,7 @@ func WriteFromFetchDir(fetchDir, outPath, arch string) error {
 		return err
 	}
 
-	root, allNodes, err := buildTreeAndWriteDataFromLayers(ws, result.Layers)
+	root, allNodes, err := buildTreeAndWriteDataFromLayers(ws, layers)
 	if err != nil {
 		return err
 	}
@@ -132,7 +167,7 @@ func readFetchResult(fetchDir string) (*fetchResult, error) {
 	return &r, nil
 }
 
-func buildTreeAndWriteDataFromLayers(ws *writeState, layers []fetchLayer) (*node, []*node, error) {
+func buildTreeAndWriteDataFromLayers(ws *writeState, layers []LayerSource) (*node, []*node, error) {
 	root := &node{
 		name:  "",
 		kind:  nodeDirectory,
@@ -149,7 +184,7 @@ func buildTreeAndWriteDataFromLayers(ws *writeState, layers []fetchLayer) (*node
 
 	for layerIndex := len(layers) - 1; layerIndex >= 0; layerIndex-- {
 		layer := layers[layerIndex]
-		rc, err := openLayerReader(layer)
+		rc, err := openLayerStream(layer)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -162,13 +197,13 @@ func buildTreeAndWriteDataFromLayers(ws *writeState, layers []fetchLayer) (*node
 			}
 			if err != nil {
 				rc.Close()
-				return nil, nil, fmt.Errorf("read tar header from %s: %w", layer.Path, err)
+				return nil, nil, fmt.Errorf("read tar header from %s: %w", layer.Name, err)
 			}
 
 			rel, err := cleanRelPath(hdr.Name)
 			if err != nil {
 				rc.Close()
-				return nil, nil, fmt.Errorf("invalid path %q in %s: %w", hdr.Name, layer.Path, err)
+				return nil, nil, fmt.Errorf("invalid path %q in %s: %w", hdr.Name, layer.Name, err)
 			}
 			if rel == "" {
 				continue
@@ -213,7 +248,7 @@ func buildTreeAndWriteDataFromLayers(ws *writeState, layers []fetchLayer) (*node
 			case tar.TypeReg, tar.TypeRegA:
 				if hdr.Size < 0 {
 					rc.Close()
-					return nil, nil, fmt.Errorf("negative file size for %s in %s", rel, layer.Path)
+					return nil, nil, fmt.Errorf("negative file size for %s in %s", rel, layer.Name)
 				}
 
 				startRel := ws.relPos
@@ -227,7 +262,7 @@ func buildTreeAndWriteDataFromLayers(ws *writeState, layers []fetchLayer) (*node
 					nr, err := io.ReadFull(tr, buf[:chunk])
 					if err != nil {
 						rc.Close()
-						return nil, nil, fmt.Errorf("read file payload for %s from %s: %w", rel, layer.Path, err)
+						return nil, nil, fmt.Errorf("read file payload for %s from %s: %w", rel, layer.Name, err)
 					}
 					if err := ws.write(buf[:nr]); err != nil {
 						rc.Close()
@@ -267,7 +302,7 @@ func buildTreeAndWriteDataFromLayers(ws *writeState, layers []fetchLayer) (*node
 				targetNode := nodeByPath[target]
 				if targetNode == nil || targetNode.kind != nodeRegular {
 					rc.Close()
-					return nil, nil, fmt.Errorf("invalid hardlink %q -> %q in %s", rel, hdr.Linkname, layer.Path)
+					return nil, nil, fmt.Errorf("invalid hardlink %q -> %q in %s", rel, hdr.Linkname, layer.Name)
 				}
 				n := &node{
 					name:         path.Base(rel),
@@ -286,7 +321,7 @@ func buildTreeAndWriteDataFromLayers(ws *writeState, layers []fetchLayer) (*node
 		}
 
 		if err := rc.Close(); err != nil {
-			return nil, nil, fmt.Errorf("close layer %s: %w", layer.Path, err)
+			return nil, nil, fmt.Errorf("close layer %s: %w", layer.Name, err)
 		}
 	}
 
@@ -574,28 +609,32 @@ func cleanRelPath(name string) (string, error) {
 	return clean, nil
 }
 
-func openLayerReader(layer fetchLayer) (io.ReadCloser, error) {
-	f, err := os.Open(layer.Path)
+func openLayerStream(layer LayerSource) (io.ReadCloser, error) {
+	if layer.Open == nil {
+		return nil, fmt.Errorf("layer %s has no opener", layer.Name)
+	}
+
+	rc, err := layer.Open()
 	if err != nil {
-		return nil, fmt.Errorf("open layer %s: %w", layer.Path, err)
+		return nil, err
 	}
 
 	comp, err := layerCompression(layer.MediaType)
 	if err != nil {
-		f.Close()
+		rc.Close()
 		return nil, err
 	}
 	if comp == "none" {
-		return f, nil
+		return rc, nil
 	}
 
-	gr, err := gzip.NewReader(f)
+	gr, err := gzip.NewReader(rc)
 	if err != nil {
-		f.Close()
-		return nil, fmt.Errorf("open gzip layer %s: %w", layer.Path, err)
+		rc.Close()
+		return nil, fmt.Errorf("open gzip layer %s: %w", layer.Name, err)
 	}
 
-	return &gzipLayerReader{f: f, gr: gr}, nil
+	return &gzipLayerReader{rc: rc, gr: gr}, nil
 }
 
 func layerCompression(mediaType string) (string, error) {
@@ -615,7 +654,7 @@ func layerCompression(mediaType string) (string, error) {
 }
 
 type gzipLayerReader struct {
-	f  *os.File
+	rc io.Closer
 	gr *gzip.Reader
 }
 
@@ -625,7 +664,7 @@ func (g *gzipLayerReader) Read(p []byte) (int, error) {
 
 func (g *gzipLayerReader) Close() error {
 	err1 := g.gr.Close()
-	err2 := g.f.Close()
+	err2 := g.rc.Close()
 	if err1 != nil {
 		return err1
 	}

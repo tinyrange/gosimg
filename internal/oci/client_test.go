@@ -41,7 +41,14 @@ func TestParseImageRef(t *testing.T) {
 		{
 			name:          "localhost with port",
 			imageRef:      "localhost:5000/image:tag",
-			wantRegistry:  "https://localhost:5000/v2",
+			wantRegistry:  "http://localhost:5000/v2",
+			wantImage:     "image",
+			wantReference: "tag",
+		},
+		{
+			name:          "loopback ip with port",
+			imageRef:      "127.0.0.1:5000/image:tag",
+			wantRegistry:  "http://127.0.0.1:5000/v2",
 			wantImage:     "image",
 			wantReference: "tag",
 		},

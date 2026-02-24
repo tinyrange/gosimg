@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net"
 	"net/http"
@@ -78,6 +79,16 @@ type FetchResult struct {
 type PullResult struct {
 	FetchResult FetchResult `json:"fetch_result"`
 	RootFSDir   string      `json:"rootfs_dir"`
+}
+
+type RemoteImage struct {
+	ImageRef          string
+	Architecture      string
+	Manifest          Manifest
+	ResolvedImageName string
+	ResolvedRegistry  string
+	ResolvedReference string
+	sess              *registrySession
 }
 
 type Client struct {
@@ -188,7 +199,11 @@ func ParseImageRef(imageRef string) (registry string, image string, reference st
 	}
 
 	if !strings.HasPrefix(registry, "http://") && !strings.HasPrefix(registry, "https://") {
-		registry = "https://" + registry
+		if isLoopbackRegistry(registry) {
+			registry = "http://" + registry
+		} else {
+			registry = "https://" + registry
+		}
 	}
 
 	if !strings.HasSuffix(registry, "/v2") {
@@ -200,6 +215,143 @@ func ParseImageRef(imageRef string) (registry string, image string, reference st
 	}
 
 	return registry, image, reference, nil
+}
+
+func (c *Client) ResolveRemote(ctx context.Context, imageRef, arch string) (RemoteImage, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	normArch, err := NormalizeArchitecture(arch)
+	if err != nil {
+		return RemoteImage{}, err
+	}
+
+	registry, imageName, reference, err := ParseImageRef(imageRef)
+	if err != nil {
+		return RemoteImage{}, err
+	}
+
+	sess := &registrySession{client: c.client, registry: registry}
+
+	manifestRefPath := fmt.Sprintf("/%s/manifests/%s", imageName, reference)
+	manifestAccept := []string{
+		"application/vnd.docker.distribution.manifest.list.v2+json",
+		"application/vnd.oci.image.index.v1+json",
+		"application/vnd.docker.distribution.manifest.v2+json",
+		"application/vnd.oci.image.manifest.v1+json",
+	}
+
+	rootManifestData, err := sess.downloadBytes(ctx, manifestRefPath, manifestAccept)
+	if err != nil {
+		return RemoteImage{}, fmt.Errorf("fetch root manifest: %w", err)
+	}
+
+	manifestData := rootManifestData
+	manifest, ok := decodeManifest(rootManifestData)
+	if !ok {
+		index, err := decodeIndex(rootManifestData)
+		if err != nil {
+			return RemoteImage{}, fmt.Errorf("decode root manifest/index: %w", err)
+		}
+		desc, err := chooseManifestForArch(index, normArch)
+		if err != nil {
+			return RemoteImage{}, err
+		}
+
+		manifestByDigestPath := fmt.Sprintf("/%s/manifests/%s", imageName, desc.Digest)
+		manifestData, err = sess.downloadBytes(ctx, manifestByDigestPath,
+			[]string{"application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"})
+		if err != nil {
+			return RemoteImage{}, fmt.Errorf("fetch selected manifest: %w", err)
+		}
+
+		manifest, ok = decodeManifest(manifestData)
+		if !ok {
+			return RemoteImage{}, errors.New("selected manifest is not an OCI/Docker v2 manifest")
+		}
+	}
+
+	if manifest.Config.Digest == "" {
+		return RemoteImage{}, errors.New("manifest missing config digest")
+	}
+
+	configBlobPath := fmt.Sprintf("/%s/blobs/%s", imageName, manifest.Config.Digest)
+	configData, err := sess.downloadBytes(ctx, configBlobPath, []string{manifest.Config.MediaType, "application/octet-stream"})
+	if err != nil {
+		return RemoteImage{}, fmt.Errorf("fetch config %s: %w", manifest.Config.Digest, err)
+	}
+	if err := verifyDigestBytes(configData, manifest.Config.Digest); err != nil {
+		if !errors.Is(err, errUnsupportedDigest) {
+			return RemoteImage{}, fmt.Errorf("verify config %s: %w", manifest.Config.Digest, err)
+		}
+	}
+	cfgMeta, err := readConfigMetaBytes(configData)
+	if err != nil {
+		return RemoteImage{}, err
+	}
+	if cfgMeta.Architecture != "" && !strings.EqualFold(cfgMeta.Architecture, normArch) {
+		return RemoteImage{}, fmt.Errorf(
+			"requested architecture %q but resolved image config architecture is %q (image %s@%s)",
+			normArch, cfgMeta.Architecture, imageName, reference,
+		)
+	}
+
+	return RemoteImage{
+		ImageRef:          imageRef,
+		Architecture:      normArch,
+		Manifest:          manifest,
+		ResolvedImageName: imageName,
+		ResolvedRegistry:  registry,
+		ResolvedReference: reference,
+		sess:              sess,
+	}, nil
+}
+
+func (r RemoteImage) OpenLayer(ctx context.Context, index int) (io.ReadCloser, string, error) {
+	if r.sess == nil {
+		return nil, "", errors.New("remote image session is not initialized")
+	}
+	if index < 0 || index >= len(r.Manifest.Layers) {
+		return nil, "", fmt.Errorf("layer index %d out of range", index)
+	}
+	layer := r.Manifest.Layers[index]
+	if strings.TrimSpace(layer.Digest) == "" {
+		return nil, "", fmt.Errorf("layer %d missing digest", index)
+	}
+
+	blobPath := fmt.Sprintf("/%s/blobs/%s", r.ResolvedImageName, layer.Digest)
+	rc, err := r.sess.openBlob(ctx, blobPath, []string{layer.MediaType, "application/octet-stream"}, layer.Digest)
+	if err != nil {
+		return nil, "", err
+	}
+	return rc, layer.MediaType, nil
+}
+
+func isLoopbackRegistry(value string) bool {
+	host := strings.TrimSpace(strings.ToLower(value))
+	if host == "" {
+		return false
+	}
+
+	if strings.Contains(host, "://") {
+		u, err := url.Parse(host)
+		if err == nil && u.Host != "" {
+			host = strings.ToLower(u.Host)
+		}
+	}
+
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = strings.Trim(h, "[]")
+	} else {
+		host = strings.Trim(host, "[]")
+	}
+
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (c *Client) Fetch(ctx context.Context, imageRef, arch, outDir string) (FetchResult, error) {
@@ -462,9 +614,53 @@ func (s *registrySession) downloadBlob(ctx context.Context, p string, accept []s
 	return nil
 }
 
+func (s *registrySession) openBlob(ctx context.Context, p string, accept []string, digest string) (io.ReadCloser, error) {
+	resp, err := s.doRequest(ctx, http.MethodGet, p, accept)
+	if err != nil {
+		return nil, err
+	}
+
+	algo, wantHex, ok := splitDigest(digest)
+	if !ok || algo != "sha256" {
+		return resp.Body, nil
+	}
+
+	return &verifyingReadCloser{
+		rc:   resp.Body,
+		hash: sha256.New(),
+		want: strings.ToLower(wantHex),
+	}, nil
+}
+
 type hashWriter interface {
 	Write(p []byte) (n int, err error)
 	Sum(b []byte) []byte
+}
+
+type verifyingReadCloser struct {
+	rc       io.ReadCloser
+	hash     hash.Hash
+	want     string
+	verified bool
+}
+
+func (v *verifyingReadCloser) Read(p []byte) (int, error) {
+	n, err := v.rc.Read(p)
+	if n > 0 {
+		_, _ = v.hash.Write(p[:n])
+	}
+	if err == io.EOF && !v.verified {
+		got := hex.EncodeToString(v.hash.Sum(nil))
+		if !strings.EqualFold(got, v.want) {
+			return n, fmt.Errorf("blob digest mismatch: expected %s got %s", v.want, got)
+		}
+		v.verified = true
+	}
+	return n, err
+}
+
+func (v *verifyingReadCloser) Close() error {
+	return v.rc.Close()
 }
 
 func (s *registrySession) doRequest(ctx context.Context, method, p string, accept []string) (*http.Response, error) {
@@ -961,9 +1157,29 @@ func readConfigMeta(configPath string) (imageConfigMeta, error) {
 	if err != nil {
 		return imageConfigMeta{}, fmt.Errorf("read config %s: %w", configPath, err)
 	}
+	return readConfigMetaBytes(data)
+}
+
+func readConfigMetaBytes(data []byte) (imageConfigMeta, error) {
 	var meta imageConfigMeta
 	if err := json.Unmarshal(data, &meta); err != nil {
-		return imageConfigMeta{}, fmt.Errorf("decode config %s: %w", configPath, err)
+		return imageConfigMeta{}, fmt.Errorf("decode config blob: %w", err)
 	}
 	return meta, nil
+}
+
+func verifyDigestBytes(data []byte, digest string) error {
+	algo, expected, ok := splitDigest(digest)
+	if !ok {
+		return fmt.Errorf("invalid digest %q", digest)
+	}
+	if algo != "sha256" {
+		return errUnsupportedDigest
+	}
+	sum := sha256.Sum256(data)
+	actual := hex.EncodeToString(sum[:])
+	if !strings.EqualFold(actual, expected) {
+		return fmt.Errorf("digest mismatch: expected %s got %s", expected, actual)
+	}
+	return nil
 }
