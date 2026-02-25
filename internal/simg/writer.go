@@ -17,7 +17,7 @@ import (
 
 const (
 	sifHeaderSize     = 4096
-	sifDescriptorSize = 584
+	sifDescriptorSize = 585
 
 	sifDataPartition = int32(0x4004)
 	sifGroupMask     = uint32(0xf0000000)
@@ -359,8 +359,8 @@ func finalizeSquashFS(ws *writeState, root *node, all, inodes []*node) (int64, e
 		return 0, err
 	}
 
-	idTableStart := ws.relPos
-	if err := writeIDTable(ws); err != nil {
+	idTableStart, err := writeIDTable(ws)
+	if err != nil {
 		return 0, err
 	}
 
@@ -571,29 +571,30 @@ func writeDirectoryTable(ws *writeState, dirs []*node) error {
 	return mw.close()
 }
 
-func writeIDTable(ws *writeState) error {
-	pointerPos := ws.relPos
-	metaPos := pointerPos + 8
-
-	var ptr [8]byte
-	binary.LittleEndian.PutUint64(ptr[:], metaPos)
-	if err := ws.write(ptr[:]); err != nil {
-		return fmt.Errorf("write id table pointer: %w", err)
-	}
-
+func writeIDTable(ws *writeState) (uint64, error) {
+	// SquashFS stores ID metadata blocks first, then an index of pointers.
+	// The superblock's IDTableStart references the pointer table.
+	metaPos := ws.relPos
 	var hdr [2]byte
 	binary.LittleEndian.PutUint16(hdr[:], squashMetaUncompressed|4)
 	if err := ws.write(hdr[:]); err != nil {
-		return fmt.Errorf("write id table metadata header: %w", err)
+		return 0, fmt.Errorf("write id table metadata header: %w", err)
 	}
 
 	var id [4]byte
 	binary.LittleEndian.PutUint32(id[:], 0)
 	if err := ws.write(id[:]); err != nil {
-		return fmt.Errorf("write id table metadata payload: %w", err)
+		return 0, fmt.Errorf("write id table metadata payload: %w", err)
 	}
 
-	return nil
+	pointerPos := ws.relPos
+	var ptr [8]byte
+	binary.LittleEndian.PutUint64(ptr[:], metaPos)
+	if err := ws.write(ptr[:]); err != nil {
+		return 0, fmt.Errorf("write id table pointer: %w", err)
+	}
+
+	return pointerPos, nil
 }
 
 func encodeInode(n *node) ([]byte, error) {

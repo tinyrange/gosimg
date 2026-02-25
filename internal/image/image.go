@@ -13,7 +13,7 @@ import (
 
 const (
 	SIFHeaderSize     = 4096
-	SIFDescriptorSize = 584
+	SIFDescriptorSize = 585
 	SquashFSMagic     = "hsqs"
 )
 
